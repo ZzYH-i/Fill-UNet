@@ -1,353 +1,180 @@
-import colorsys
-import copy
-import time
-
-import cv2
-import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
-from torch import nn
+import torch.nn as nn
 
-from nets.unet import Unet as unet
-from utils.utils import cvtColor, preprocess_input, resize_image, show_config
+from nets.resnet import resnet50
+from nets.vgg import VGG16
 
-
-class Unet(object):
-    _defaults = {
-        "model_path"    : 'D:/unet-pytorch-main/logs/best_epoch_weights.pth',
-
-        "num_classes"   : 21,
-
-        "backbone"      : "vgg",
-
-        "input_shape"   : [512, 512],
-
-        "mix_type"      : 0,
-
-        "cuda"          : True,
-    }
+from nets.scfam import SCFAM
+from nets.transformer_block import BottleneckTransformer
+from nets.msfa import MSFA
 
 
-    def __init__(self, **kwargs):
-        self.__dict__.update(self._defaults)
-        for name, value in kwargs.items():
-            setattr(self, name, value)
-        if self.num_classes <= 21:
-            self.colors = [ (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), 
-                            (128, 128, 128), (64, 0, 0), (192, 0, 0), (64, 128, 0), (192, 128, 0), (64, 0, 128), (192, 0, 128), 
-                            (64, 128, 128), (192, 128, 128), (0, 64, 0), (128, 64, 0), (0, 192, 0), (128, 192, 0), (0, 64, 128), 
-                            (128, 64, 12)]
+class unetUp(nn.Module):
+    def __init__(self, low_size, high_size, out_size, use_msfa=True, use_scfam=True):
+        super(unetUp, self).__init__()
+        self.up = nn.UpsamplingBilinear2d(scale_factor=2)
+
+        self.use_msfa = use_msfa
+        self.use_scfam = use_scfam
+
+        if use_msfa:
+            self.msfa = MSFA(
+                low_channels=low_size,
+                high_channels=high_size,
+                out_channels=out_size,
+                reduction=4
+            )
+            scfam_channels = out_size
         else:
-            hsv_tuples = [(x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
-            self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
-            self.colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), self.colors))
-        self.generate()
-        
-        show_config(**self._defaults)
+            self.fuse_conv1 = nn.Conv2d(low_size + high_size, out_size, kernel_size=3, padding=1)
+            self.fuse_conv2 = nn.Conv2d(out_size, out_size, kernel_size=3, padding=1)
+            self.relu = nn.ReLU(inplace=True)
+            scfam_channels = out_size
 
-    def generate(self, onnx=False):
-        self.net = unet(num_classes = self.num_classes, backbone=self.backbone)
-
-        device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net.load_state_dict(torch.load(self.model_path, map_location=device))
-        self.net    = self.net.eval()
-        print('{} model, and classes loaded.'.format(self.model_path))
-        if not onnx:
-            if self.cuda:
-                self.net = nn.DataParallel(self.net)
-                self.net = self.net.cuda()
-
-    def detect_image(self, image, count=False, name_classes=None):
-
-        image       = cvtColor(image)
-
-        old_img     = copy.deepcopy(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-                
-
-            pr = self.net(images)[0]
-
-            pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy()
-
-            pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                    int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-
-            pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation = cv2.INTER_LINEAR)
-
-            pr = pr.argmax(axis=-1)
-        
-
-        if count:
-            classes_nums        = np.zeros([self.num_classes])
-            total_points_num    = orininal_h * orininal_w
-            print('-' * 63)
-            print("|%25s | %15s | %15s|"%("Key", "Value", "Ratio"))
-            print('-' * 63)
-            for i in range(self.num_classes):
-                num     = np.sum(pr == i)
-                ratio   = num / total_points_num * 100
-                if num > 0:
-                    print("|%25s | %15s | %14.2f%%|"%(str(name_classes[i]), str(num), ratio))
-                    print('-' * 63)
-                classes_nums[i] = num
-            print("classes_nums:", classes_nums)
-
-        if self.mix_type == 0:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-
-            image   = Image.fromarray(np.uint8(seg_img))
-
-            image   = Image.blend(old_img, image, 0.7)
-
-        elif self.mix_type == 1:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-
-            image   = Image.fromarray(np.uint8(seg_img))
-
-        elif self.mix_type == 2:
-            seg_img = (np.expand_dims(pr != 0, -1) * np.array(old_img, np.float32)).astype('uint8')
-
-            image = Image.fromarray(np.uint8(seg_img))
-        
-        return image
-
-    def get_FPS(self, image, test_interval):
-        image       = cvtColor(image)
-
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-
-            pr = self.net(images)[0]
-            pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy().argmax(axis=-1)
-            pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                    int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-
-        t1 = time.time()
-        for _ in range(test_interval):
-            with torch.no_grad():
-                pr = self.net(images)[0]
-                pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy().argmax(axis=-1)
-                pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                        int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-        t2 = time.time()
-        tact_time = (t2 - t1) / test_interval
-        return tact_time
-
-    def convert_to_onnx(self, simplify, model_path):
-        import onnx
-        self.generate(onnx=True)
-
-        im                  = torch.zeros(1, 3, *self.input_shape).to('cpu')  # image size(1, 3, 512, 512) BCHW
-        input_layer_names   = ["images"]
-        output_layer_names  = ["output"]
-        
-        # Export the model
-        print(f'Starting export with onnx {onnx.__version__}.')
-        torch.onnx.export(self.net,
-                        im,
-                        f               = model_path,
-                        verbose         = False,
-                        opset_version   = 12,
-                        training        = torch.onnx.TrainingMode.EVAL,
-                        do_constant_folding = True,
-                        input_names     = input_layer_names,
-                        output_names    = output_layer_names,
-                        dynamic_axes    = None)
-
-        # Checks
-        model_onnx = onnx.load(model_path)  # load onnx model
-        onnx.checker.check_model(model_onnx)  # check onnx model
-
-        # Simplify onnx
-        if simplify:
-            import onnxsim
-            print(f'Simplifying with onnx-simplifier {onnxsim.__version__}.')
-            model_onnx, check = onnxsim.simplify(
-                model_onnx,
-                dynamic_input_shape=False,
-                input_shapes=None)
-            assert check, 'assert check failed'
-            onnx.save(model_onnx, model_path)
-
-        print('Onnx model save as {}'.format(model_path))
-
-    def get_miou_png(self, image):
-        image       = cvtColor(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-
-            pr = self.net(images)[0]
-            pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy()
-            pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                    int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-            pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation = cv2.INTER_LINEAR)
-            pr = pr.argmax(axis=-1)
-    
-        image = Image.fromarray(np.uint8(pr))
-        return image
-
-class Unet_ONNX(object):
-    _defaults = {
-        "onnx_path"    : 'model_data/models.onnx',
-        "num_classes"   : 21,
-        "backbone"      : "vgg",
-        "input_shape"   : [512, 512],
-        "mix_type"      : 0,
-    }
-    
-    @classmethod
-    def get_defaults(cls, n):
-        if n in cls._defaults:
-            return cls._defaults[n]
+        if use_scfam:
+            self.scfam = SCFAM(scfam_channels, reduction=2, use_residual=True)
         else:
-            return "Unrecognized attribute name '" + n + "'"
+            self.scfam = nn.Identity()
 
-    def __init__(self, **kwargs):
-        self.__dict__.update(self._defaults)
-        for name, value in kwargs.items():
-            setattr(self, name, value)
-            self._defaults[name] = value 
-            
-        import onnxruntime
-        self.onnx_session   = onnxruntime.InferenceSession(self.onnx_path)
-        self.input_name     = self.get_input_name()
-        self.output_name    = self.get_output_name()
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(out_size, out_size, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
 
-        if self.num_classes <= 21:
-            self.colors = [ (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), 
-                            (128, 128, 128), (64, 0, 0), (192, 0, 0), (64, 128, 0), (192, 128, 0), (64, 0, 128), (192, 0, 128), 
-                            (64, 128, 128), (192, 128, 128), (0, 64, 0), (128, 64, 0), (0, 192, 0), (128, 192, 0), (0, 64, 128), 
-                            (128, 64, 12)]
+    def forward(self, inputs1, inputs2):
+
+        up_inputs2 = self.up(inputs2)
+
+        if self.use_msfa:
+            outputs = self.msfa(inputs1, up_inputs2)
         else:
-            hsv_tuples = [(x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
-            self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
-            self.colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), self.colors))
+            outputs = torch.cat([inputs1, up_inputs2], 1)
+            outputs = self.fuse_conv1(outputs)
+            outputs = self.relu(outputs)
+            outputs = self.fuse_conv2(outputs)
+            outputs = self.relu(outputs)
 
-        show_config(**self._defaults)
+        outputs = self.scfam(outputs)
+        outputs = self.out_conv(outputs)
+        return outputs
 
-    def get_input_name(self):
-        input_name=[]
-        for node in self.onnx_session.get_inputs():
-            input_name.append(node.name)
-        return input_name
- 
-    def get_output_name(self):
-        output_name=[]
-        for node in self.onnx_session.get_outputs():
-            output_name.append(node.name)
-        return output_name
- 
-    def get_input_feed(self,image_tensor):
-        input_feed={}
-        for name in self.input_name:
-            input_feed[name]=image_tensor
-        return input_feed
+class Unet(nn.Module):
+    def __init__(
+        self,
+        num_classes=21,
+        pretrained=False,
+        backbone='vgg',
+        use_transformer=True,
+        use_msfa=True,
+        use_scfam=True
+    ):
+        super(Unet, self).__init__()
+        self.backbone = backbone
 
-    def resize_image(self, image, size):
-        iw, ih  = image.size
-        w, h    = size
+        if backbone == 'vgg':
+            self.vgg = VGG16(pretrained=pretrained)
 
-        scale   = min(w/iw, h/ih)
-        nw      = int(iw*scale)
-        nh      = int(ih*scale)
+            encoder_filters = [64, 128, 256, 512, 512]
+            bottleneck_channels = 512
 
-        image   = image.resize((nw,nh), Image.BICUBIC)
-        new_image = Image.new('RGB', size, (128,128,128))
-        new_image.paste(image, ((w-nw)//2, (h-nh)//2))
+        elif backbone == "resnet50":
+            self.resnet = resnet50(pretrained=pretrained)
 
-        return new_image, nw, nh
+            encoder_filters = [64, 256, 512, 1024, 2048]
+            bottleneck_channels = 2048
 
-    def detect_image(self, image, count=False, name_classes=None):
-        image       = cvtColor(image)
-        old_img     = copy.deepcopy(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        else:
+            raise ValueError('Unsupported backbone - `{}`, Use vgg, resnet50.'.format(backbone))
 
-        input_feed  = self.get_input_feed(image_data)
-        pr          = self.onnx_session.run(output_names=self.output_name, input_feed=input_feed)[0][0]
+        out_filters = [64, 128, 256, 512]
 
-        def softmax(x, axis):
-            x -= np.max(x, axis=axis, keepdims=True)
-            f_x = np.exp(x) / np.sum(np.exp(x), axis=axis, keepdims=True)
-            return f_x
-        print(np.shape(pr))
-        pr = softmax(np.transpose(pr, (1, 2, 0)), -1)
-        pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-        pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation = cv2.INTER_LINEAR)
-        pr = pr.argmax(axis=-1)
+        if use_transformer:
+            self.bottleneck_transformer = BottleneckTransformer(
+                in_channels=bottleneck_channels,
+                embed_dim=512,
+                num_heads=8,
+                num_layers=1,
+                mlp_ratio=4.0,
+                drop=0.1
+            )
+        else:
+            self.bottleneck_transformer = nn.Identity()
 
-        if count:
-            classes_nums        = np.zeros([self.num_classes])
-            total_points_num    = orininal_h * orininal_w
-            print('-' * 63)
-            print("|%25s | %15s | %15s|"%("Key", "Value", "Ratio"))
-            print('-' * 63)
-            for i in range(self.num_classes):
-                num     = np.sum(pr == i)
-                ratio   = num / total_points_num * 100
-                if num > 0:
-                    print("|%25s | %15s | %14.2f%%|"%(str(name_classes[i]), str(num), ratio))
-                    print('-' * 63)
-                classes_nums[i] = num
-            print("classes_nums:", classes_nums)
+        self.up_concat4 = unetUp(
+            low_size=encoder_filters[3],
+            high_size=encoder_filters[4],
+            out_size=out_filters[3],
+            use_msfa=use_msfa,
+            use_scfam=use_scfam
+        )
+        self.up_concat3 = unetUp(
+            low_size=encoder_filters[2],
+            high_size=out_filters[3],
+            out_size=out_filters[2],
+            use_msfa=use_msfa,
+            use_scfam=use_scfam
+        )
+        self.up_concat2 = unetUp(
+            low_size=encoder_filters[1],
+            high_size=out_filters[2],
+            out_size=out_filters[1],
+            use_msfa=use_msfa,
+            use_scfam=use_scfam
+        )
+        self.up_concat1 = unetUp(
+            low_size=encoder_filters[0],
+            high_size=out_filters[1],
+            out_size=out_filters[0],
+            use_msfa=use_msfa,
+            use_scfam=use_scfam
+        )
 
-        if self.mix_type == 0:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-            image   = Image.fromarray(np.uint8(seg_img))
-            image   = Image.blend(old_img, image, 0.7)
+        if backbone == 'resnet50':
+            self.up_conv = nn.Sequential(
+                nn.UpsamplingBilinear2d(scale_factor=2),
+                nn.Conv2d(out_filters[0], out_filters[0], kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(out_filters[0], out_filters[0], kernel_size=3, padding=1),
+                nn.ReLU(),
+            )
+        else:
+            self.up_conv = None
 
-        elif self.mix_type == 1:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-            image   = Image.fromarray(np.uint8(seg_img))
+        self.final = nn.Conv2d(out_filters[0], num_classes, 1)
 
-        elif self.mix_type == 2:
-            seg_img = (np.expand_dims(pr != 0, -1) * np.array(old_img, np.float32)).astype('uint8')
-            image = Image.fromarray(np.uint8(seg_img))
-        
-        return image
+    def forward(self, inputs):
+        if self.backbone == "vgg":
+            [feat1, feat2, feat3, feat4, feat5] = self.vgg.forward(inputs)
+        elif self.backbone == "resnet50":
+            [feat1, feat2, feat3, feat4, feat5] = self.resnet.forward(inputs)
+
+        # bottleneck transformer
+        feat5 = self.bottleneck_transformer(feat5)
+
+        # decoder: MSFA + SCFAM
+        up4 = self.up_concat4(feat4, feat5)
+        up3 = self.up_concat3(feat3, up4)
+        up2 = self.up_concat2(feat2, up3)
+        up1 = self.up_concat1(feat1, up2)
+
+        if self.up_conv is not None:
+            up1 = self.up_conv(up1)
+
+        final = self.final(up1)
+        return final
+
+    def freeze_backbone(self):
+        if self.backbone == "vgg":
+            for param in self.vgg.parameters():
+                param.requires_grad = False
+        elif self.backbone == "resnet50":
+            for param in self.resnet.parameters():
+                param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        if self.backbone == "vgg":
+            for param in self.vgg.parameters():
+                param.requires_grad = True
+        elif self.backbone == "resnet50":
+            for param in self.resnet.parameters():
+                param.requires_grad = True

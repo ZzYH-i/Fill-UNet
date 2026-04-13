@@ -80,7 +80,7 @@ if __name__ == "__main__":
         else:
             download_weights(backbone)
 
-    model = Unet(num_classes=num_classes, pretrained=pretrained, backbone=backbone).train()
+    model = Unet(num_classes=num_classes, pretrained=pretrained, backbone=backbone, use_transformer=True, use_msfa=True, use_scfam=True).train()
     if not pretrained:
         weights_init(model)
     if model_path != '':
@@ -101,7 +101,7 @@ if __name__ == "__main__":
         if local_rank == 0:
             print("\nSuccessful Load Key:", str(load_key)[:500], "……\nSuccessful Load Key Num:", len(load_key))
             print("\nFail To Load Key:", str(no_load_key)[:500], "……\nFail To Load Key num:", len(no_load_key))
-            print("\n\033[1;33;44m温馨提示，head部分没有载入是正常现象，Backbone部分没有载入是错误的。\033[0m")
+            print("\n\033[1;33;44mPlease note that it is normal for the `head` section not to load, but it is an error if the Backbone section does not load.\033[0m")
 
 
     if local_rank == 0:
@@ -173,7 +173,7 @@ if __name__ == "__main__":
         epoch_step_val  = num_val // batch_size
         
         if epoch_step == 0 or epoch_step_val == 0:
-            raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
+            raise ValueError("The dataset is too small to continue training. Please expand the dataset.")
 
         train_dataset   = UnetDataset(train_lines, input_shape, num_classes, True, VOCdevkit_path)
         val_dataset     = UnetDataset(val_lines, input_shape, num_classes, False, VOCdevkit_path)
@@ -221,7 +221,7 @@ if __name__ == "__main__":
                 epoch_step_val  = num_val // batch_size
 
                 if epoch_step == 0 or epoch_step_val == 0:
-                    raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
+                    raise ValueError("The dataset is too small to continue training. Please expand the dataset.")
 
                 if distributed:
                     batch_size = batch_size // ngpus_per_node
